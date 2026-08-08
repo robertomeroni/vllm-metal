@@ -421,6 +421,12 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
                 0,
                 *[s.start_row + s.num_query_tokens for s in decode_segments],
             ],
+            # Decode-only batches need every row, so the logits layout matches
+            # the packed one whether or not selection is available.
+            logits_cu_seqlens=[
+                0,
+                *[s.start_row + s.num_query_tokens for s in decode_segments],
+            ],
             decode_segments=decode_segments,
             num_decode_tokens=sum(s.num_query_tokens for s in decode_segments),
             mm_prefill_deltas={},
@@ -447,8 +453,13 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["block_size"] = block_sizes[0]
             captured["merge_verify_windows"] = merge_verify_windows
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
             del cache
+            captured["logits_indices"] = (
+                None if logits_indices is None else logits_indices.tolist()
+            )
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
             return mr.TargetModelForwardOutput(
@@ -507,8 +518,10 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             del prefill_info, block_sizes, merge_verify_windows
             captured["decode_info"] = decode_info
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
-            del cache, collect_hidden_states
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
+            del cache, collect_hidden_states, logits_indices
             captured["input_ids"] = input_ids.tolist()
             return mr.TargetModelForwardOutput(
                 logits=mx.zeros((1, 1, 16)),
@@ -555,8 +568,13 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_sizes[0]
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
             del cache
+            captured["logits_indices"] = (
+                None if logits_indices is None else logits_indices.tolist()
+            )
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
             return mr.TargetModelForwardOutput(logits=mx.zeros((1, 1, 16)))
@@ -699,8 +717,13 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_sizes[0]
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
             del cache
+            captured["logits_indices"] = (
+                None if logits_indices is None else logits_indices.tolist()
+            )
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
             return mr.TargetModelForwardOutput(
@@ -750,8 +773,13 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_sizes[0]
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
             del cache
+            captured["logits_indices"] = (
+                None if logits_indices is None else logits_indices.tolist()
+            )
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
             return mr.TargetModelForwardOutput(
@@ -810,8 +838,13 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             captured["prefill_info"] = prefill_info
             captured["block_size"] = block_sizes[0]
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
             del cache
+            captured["logits_indices"] = (
+                None if logits_indices is None else logits_indices.tolist()
+            )
             captured["input_ids"] = input_ids.tolist()
             captured["collect_hidden_states"] = collect_hidden_states
             return mr.TargetModelForwardOutput(logits=mx.zeros((1, 2, 16)))
@@ -1060,6 +1093,7 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
             logits=self._make_logits([0, 7]),
             target_hidden_states=mx.array([[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]]),
             cu_seqlens=[0, 2],
+            logits_cu_seqlens=[0, 2],
             decode_segments=(),
             num_decode_tokens=0,
             mm_prefill_deltas={},
@@ -1937,8 +1971,10 @@ class TestV1MetalModelRunnerGDNLifecycle:
 
         captured: dict[str, object] = {}
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
-            del cache, collect_hidden_states
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
+            del cache, collect_hidden_states, logits_indices
             ctx = mr.get_context()
             assert ctx is not None
             captured["input_ids"] = input_ids.tolist()
@@ -2070,6 +2106,195 @@ class TestRunnerMlaProperties:
             {"num_hidden_layers": 32, "num_attention_heads": 32, "hidden_size": 4096}
         )
         assert runner.is_mla is False
+
+
+class TestPagedLogitsIndices:
+    """Row selection for the paged target forward.
+
+    The packed row order is ``[decode/spec rows][prefill 0 rows]...``. Every
+    decode row is consumed, but prefill sampling only reads each segment's last
+    row, so those are the only rows the projection has to produce."""
+
+    def _make_runner(self, **attrs) -> mr.MetalModelRunner:
+        return make_stub_runner(_selective_logits_supported=True, **attrs)
+
+    def test_returns_none_when_selection_unsupported(self) -> None:
+        runner = make_stub_runner(_selective_logits_supported=False)
+        assert (
+            runner._paged_logits_indices(
+                [0, 4], num_decode_tokens=0, num_decode_segments=0
+            )
+            is None
+        )
+
+    def test_returns_none_for_pure_decode(self) -> None:
+        # Every row is sampled, so selecting would gather all of them and buy
+        # nothing; the model's own __call__ is kept instead.
+        runner = self._make_runner()
+        assert (
+            runner._paged_logits_indices(
+                [0, 1, 2], num_decode_tokens=2, num_decode_segments=2
+            )
+            is None
+        )
+
+    def test_selects_last_row_of_each_prefill(self) -> None:
+        runner = self._make_runner()
+        indices = runner._paged_logits_indices(
+            [0, 4, 6, 9], num_decode_tokens=0, num_decode_segments=0
+        )
+        assert indices is not None
+        assert indices.tolist() == [3, 5, 8]
+        assert indices.dtype == mx.int32
+
+    def test_keeps_decode_prefix_then_appends_prefill_rows(self) -> None:
+        # 2 decode rows, then prefills of 3 and 2 rows. Decode rows stay in place
+        # so start_row stays valid; the prefill ends are 1+3-1=4 and 4+2-1=6.
+        runner = self._make_runner()
+        indices = runner._paged_logits_indices(
+            [0, 1, 2, 5, 7], num_decode_tokens=2, num_decode_segments=2
+        )
+        assert indices is not None
+        assert indices.tolist() == [0, 1, 4, 6]
+
+    def test_keeps_full_spec_verify_span_in_mixed_batch(self) -> None:
+        # All three verify rows survive (argmax over the whole span decides
+        # acceptance); only the prefill's final row 6 is added.
+        runner = self._make_runner()
+        indices = runner._paged_logits_indices(
+            [0, 3, 7], num_decode_tokens=3, num_decode_segments=1
+        )
+        assert indices is not None
+        assert indices.tolist() == [0, 1, 2, 6]
+
+
+class TestCompactLogitsCuSeqlens:
+    """Boundary rewrite for selectively projected logits.
+
+    ``cu_seqlens`` keeps describing the packed hidden states (the pooler and the
+    Gemma4 MTP proposer index those); the rewritten copy describes the logits
+    tensor, whose prefill spans are one row each."""
+
+    def test_prefill_spans_collapse_to_one_row(self) -> None:
+        compact = mr._compact_logits_cu_seqlens([0, 4, 6, 9], num_decode_segments=0)
+        assert compact == [0, 1, 2, 3]
+
+    def test_decode_prefix_lengths_are_preserved(self) -> None:
+        compact = mr._compact_logits_cu_seqlens([0, 1, 2, 5, 7], num_decode_segments=2)
+        assert compact == [0, 1, 2, 3, 4]
+
+    def test_spec_verify_span_length_is_preserved(self) -> None:
+        compact = mr._compact_logits_cu_seqlens([0, 3, 7], num_decode_segments=1)
+        assert compact == [0, 3, 4]
+
+
+class TestStartPagedForwardSelectiveLogits:
+    """``_start_paged_forward`` wiring: what it asks the adapter for, and the
+    logits layout it records for the sampling half of the step."""
+
+    def _make_runner(self, **attrs) -> mr.MetalModelRunner:
+        return make_stub_runner(
+            model_args={"vocab_size": 16},
+            _paged_block_size=4,
+            num_layers=0,
+            **{"_selective_logits_supported": True, **attrs},
+        )
+
+    def _make_prefill(self, req_id: str, token_ids: list[int]) -> mr.PrefillRequest:
+        return mr.PrefillRequest(
+            req_id=req_id,
+            token_ids=token_ids,
+            sampling_params=SamplingParams(),
+            block_ids=[[0]],
+            generator=None,
+            prompt_len=len(token_ids),
+            start_pos=0,
+            full_prompt_token_ids=None,
+        )
+
+    def _run(
+        self,
+        runner: mr.MetalModelRunner,
+        monkeypatch,
+        prefill_reqs: list[mr.PrefillRequest],
+        *,
+        num_logits_rows: int,
+    ) -> dict[str, object]:
+        captured: dict[str, object] = {}
+
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
+            del cache, collect_hidden_states
+            captured["logits_indices"] = (
+                None if logits_indices is None else logits_indices.tolist()
+            )
+            return mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, num_logits_rows, 16)),
+            )
+
+        monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
+        monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
+
+        scheduler_output = self._make_scheduler_output(
+            {pr.req_id: len(pr.token_ids) for pr in prefill_reqs}
+        )
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=prefill_reqs,
+            decode_reqs=[],
+            scheduler_output=scheduler_output,
+        )
+        return captured
+
+    def _make_scheduler_output(
+        self, num_scheduled_tokens: dict[str, int]
+    ) -> SchedulerOutput:
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            num_scheduled_tokens=num_scheduled_tokens,
+            total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens=None,
+            num_spec_tokens_to_schedule=1,
+        )
+
+    def test_requests_only_the_sampled_prefill_rows(self, monkeypatch) -> None:
+        # Two prefills of 3 and 2 tokens pack 5 rows; only rows 2 and 4 sample.
+        runner = self._make_runner()
+        captured = self._run(
+            runner,
+            monkeypatch,
+            [self._make_prefill("r0", [1, 2, 3]), self._make_prefill("r1", [4, 5])],
+            num_logits_rows=2,
+        )
+
+        assert captured["logits_indices"] == [2, 4]
+        state = runner._execute_model_state
+        assert state is not None
+        # The packed layout is kept for the hidden-state consumers...
+        assert state.cu_seqlens == [0, 3, 5]
+        # ...while the logits layout has one row per prefill.
+        assert state.logits_cu_seqlens == [0, 1, 2]
+
+    def test_does_not_request_selection_when_unsupported(self, monkeypatch) -> None:
+        runner = self._make_runner(_selective_logits_supported=False)
+        captured = self._run(
+            runner,
+            monkeypatch,
+            [self._make_prefill("r0", [1, 2, 3])],
+            num_logits_rows=3,
+        )
+
+        assert captured["logits_indices"] is None
+        state = runner._execute_model_state
+        assert state is not None
+        assert state.logits_cu_seqlens == state.cu_seqlens == [0, 3]
 
 
 class TestMergeVerifyWindows:
@@ -2441,6 +2666,8 @@ class TestDeferredDecodeSampleThreading:
             target_hidden_states=None,
             pooling_hidden_states=None,
             cu_seqlens=list(range(len(decode_reqs) + 1)),
+            # Decode-only batch: one row per request, so selection is a no-op.
+            logits_cu_seqlens=list(range(len(decode_reqs) + 1)),
             decode_segments=[],
             num_decode_tokens=len(decode_reqs),
             mm_prefill_deltas={},
@@ -2506,8 +2733,10 @@ class TestDeferredDecodeSampleThreading:
         )
         captured: dict[str, object] = {}
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
-            del cache, collect_hidden_states
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
+            del cache, collect_hidden_states, logits_indices
             captured["input_ids"] = input_ids.tolist()
             return mr.TargetModelForwardOutput(
                 logits=mx.zeros((1, 1, 4)), hidden_states=None
@@ -2927,8 +3156,10 @@ class TestIntermediateBodyOnlyForward:
                 )
             )
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
-            del cache, collect_hidden_states
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
+            del cache, collect_hidden_states, logits_indices
             captured["full_forward_tokens"] = input_ids.tolist()
             num_tokens = input_ids.shape[1]
             return mr.TargetModelForwardOutput(
@@ -2965,8 +3196,10 @@ class TestIntermediateBodyOnlyForward:
         runner._paged_block_size = 4
         runner._intermediate_forward_supported = False
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
-            del cache, collect_hidden_states
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
+            del cache, collect_hidden_states, logits_indices
             captured["full_forward_tokens"] = input_ids.tolist()
             return mr.TargetModelForwardOutput(
                 logits=mx.zeros((1, 2, 16)), hidden_states=None
@@ -3031,8 +3264,10 @@ class TestIntermediateBodyOnlyForward:
             needs_target_hidden_states=lambda decode_segments, has_final_prefill: True
         )
 
-        def fake_target_forward(input_ids, *, cache, collect_hidden_states):
-            del cache
+        def fake_target_forward(
+            input_ids, *, cache, collect_hidden_states, logits_indices=None
+        ):
+            del cache, logits_indices
             captured["collect_hidden_states"] = collect_hidden_states
             return mr.TargetModelForwardOutput(
                 logits=mx.zeros((1, 2, 16)),
@@ -3072,6 +3307,7 @@ class TestIntermediateBodyOnlyForward:
             target_hidden_states=None,
             pooling_hidden_states=None,
             cu_seqlens=[0, 2],
+            logits_cu_seqlens=[0, 2],
             decode_segments=(),
             num_decode_tokens=len(decode_reqs),
             mm_prefill_deltas={},
