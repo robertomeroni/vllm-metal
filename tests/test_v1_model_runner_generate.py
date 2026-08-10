@@ -2168,26 +2168,6 @@ class TestPagedLogitsIndices:
         assert indices.tolist() == [0, 1, 2, 6]
 
 
-class TestCompactLogitsCuSeqlens:
-    """Boundary rewrite for selectively projected logits.
-
-    ``cu_seqlens`` keeps describing the packed hidden states (the pooler and the
-    Gemma4 MTP proposer index those); the rewritten copy describes the logits
-    tensor, whose prefill spans are one row each."""
-
-    def test_prefill_spans_collapse_to_one_row(self) -> None:
-        compact = mr._compact_logits_cu_seqlens([0, 4, 6, 9], num_decode_segments=0)
-        assert compact == [0, 1, 2, 3]
-
-    def test_decode_prefix_lengths_are_preserved(self) -> None:
-        compact = mr._compact_logits_cu_seqlens([0, 1, 2, 5, 7], num_decode_segments=2)
-        assert compact == [0, 1, 2, 3, 4]
-
-    def test_spec_verify_span_length_is_preserved(self) -> None:
-        compact = mr._compact_logits_cu_seqlens([0, 3, 7], num_decode_segments=1)
-        assert compact == [0, 3, 4]
-
-
 class TestStartPagedForwardSelectiveLogits:
     """``_start_paged_forward`` wiring: what it asks the adapter for, and the
     logits layout it records for the sampling half of the step."""
@@ -2219,6 +2199,8 @@ class TestStartPagedForwardSelectiveLogits:
         prefill_reqs: list[mr.PrefillRequest],
         *,
         num_logits_rows: int,
+        decode_reqs: list[tuple[str, mr.RequestState]] | None = None,
+        spec_tokens: dict[str, list[int]] | None = None,
     ) -> dict[str, object]:
         captured: dict[str, object] = {}
 
@@ -2236,26 +2218,32 @@ class TestStartPagedForwardSelectiveLogits:
         monkeypatch.setattr(mr, "prepare_grouped", lambda *a, **k: None)
         monkeypatch.setattr(runner, "_target_forward", fake_target_forward)
 
-        scheduler_output = self._make_scheduler_output(
-            {pr.req_id: len(pr.token_ids) for pr in prefill_reqs}
-        )
+        decode_reqs = decode_reqs or []
+        spec_tokens = spec_tokens or {}
+        num_scheduled = {
+            req_id: 1 + len(spec_tokens.get(req_id, ())) for req_id, _ in decode_reqs
+        }
+        num_scheduled.update({pr.req_id: len(pr.token_ids) for pr in prefill_reqs})
+        scheduler_output = self._make_scheduler_output(num_scheduled, spec_tokens)
         runner._start_paged_forward(
             mr._ExecutionBatch(),
             prefill_reqs=prefill_reqs,
-            decode_reqs=[],
+            decode_reqs=decode_reqs,
             scheduler_output=scheduler_output,
         )
         return captured
 
     def _make_scheduler_output(
-        self, num_scheduled_tokens: dict[str, int]
+        self,
+        num_scheduled_tokens: dict[str, int],
+        spec_tokens: dict[str, list[int]] | None = None,
     ) -> SchedulerOutput:
         return SchedulerOutput(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
-            scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_tokens=spec_tokens or {},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
@@ -2295,6 +2283,62 @@ class TestStartPagedForwardSelectiveLogits:
         state = runner._execute_model_state
         assert state is not None
         assert state.logits_cu_seqlens == state.cu_seqlens == [0, 3]
+
+    def test_keeps_decode_prefix_rows_ahead_of_prefill_rows(self, monkeypatch) -> None:
+        # 2 decode rows, then a 3-token prefill. The decode rows stay in place so
+        # each segment's start_row is still valid; only the prefill's last row is
+        # added, and the logits layout keeps the decode prefix verbatim.
+        runner = self._make_runner()
+        runner._paged_request_seq_lens["d0"] = 1
+        runner._paged_request_seq_lens["d1"] = 1
+        captured = self._run(
+            runner,
+            monkeypatch,
+            [self._make_prefill("r0", [1, 2, 3])],
+            num_logits_rows=3,
+            decode_reqs=[
+                ("d0", self._make_decode_state()),
+                ("d1", self._make_decode_state()),
+            ],
+        )
+
+        assert captured["logits_indices"] == [0, 1, 4]
+        state = runner._execute_model_state
+        assert state is not None
+        assert state.cu_seqlens == [0, 1, 2, 5]
+        assert state.logits_cu_seqlens == [0, 1, 2, 3]
+
+    def test_keeps_whole_spec_verify_span(self, monkeypatch) -> None:
+        # Spec verification reads the argmax over its whole span, so all 3 verify
+        # rows survive and the span length carries into the logits layout.
+        runner = self._make_runner()
+        runner._paged_request_seq_lens["d0"] = 1
+        captured = self._run(
+            runner,
+            monkeypatch,
+            [self._make_prefill("r0", [1, 2, 3, 4])],
+            num_logits_rows=4,
+            decode_reqs=[("d0", self._make_decode_state([1, 6]))],
+            spec_tokens={"d0": [7, 8]},
+        )
+
+        assert captured["logits_indices"] == [0, 1, 2, 6]
+        state = runner._execute_model_state
+        assert state is not None
+        assert state.cu_seqlens == [0, 3, 7]
+        assert state.logits_cu_seqlens == [0, 3, 4]
+
+    def _make_decode_state(self, token_ids: list[int] | None = None) -> mr.RequestState:
+        token_ids = [1] if token_ids is None else token_ids
+        return mr.RequestState(
+            token_ids=token_ids,
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            generated_tokens=len(token_ids) - 1,
+            block_ids=[[0, 1]],
+        )
 
 
 class TestMergeVerifyWindows:

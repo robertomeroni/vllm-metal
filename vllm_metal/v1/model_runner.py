@@ -158,22 +158,6 @@ def _create_request_generator(
     return generator
 
 
-def _compact_logits_cu_seqlens(
-    cu_seqlens: list[int],
-    *,
-    num_decode_segments: int,
-) -> list[int]:
-    """Return ``cu_seqlens`` rewritten for selectively projected logits.
-
-    The decode/spec prefix is projected unchanged, so its boundaries carry over
-    verbatim; each prefill segment collapses to its single last-token row.
-    """
-    compact = cu_seqlens[: num_decode_segments + 1]
-    for _ in cu_seqlens[num_decode_segments + 1 :]:
-        compact.append(compact[-1] + 1)
-    return compact
-
-
 @dataclass
 class RequestState:
     """State for an ongoing request with KV cache."""
@@ -1429,6 +1413,17 @@ class MetalModelRunner:
                 forward_outputs.append(target_hidden_states)
             self._submit_paged_forward_outputs(*forward_outputs)
 
+        # `cu_seqlens` keeps describing the packed hidden states, which the pooler
+        # and the Gemma4 MTP proposer index. When the head only projected the
+        # sampled rows, the logits tensor has a different layout: the decode/spec
+        # prefix is unchanged and every prefill segment is now one row.
+        if logits_indices is None:
+            logits_cu_seqlens = cu_seqlens
+        else:
+            logits_cu_seqlens = cu_seqlens[: len(decode_segments) + 1]
+            for _ in cu_seqlens[len(decode_segments) + 1 :]:
+                logits_cu_seqlens.append(logits_cu_seqlens[-1] + 1)
+
         self._execute_model_state = _PagedForwardState(
             batch=batch,
             prefill_reqs=prefill_reqs,
@@ -1438,13 +1433,7 @@ class MetalModelRunner:
             target_hidden_states=target_hidden_states,
             pooling_hidden_states=pooling_hidden_states,
             cu_seqlens=cu_seqlens,
-            logits_cu_seqlens=(
-                cu_seqlens
-                if logits_indices is None
-                else _compact_logits_cu_seqlens(
-                    cu_seqlens, num_decode_segments=len(decode_segments)
-                )
-            ),
+            logits_cu_seqlens=logits_cu_seqlens,
             decode_segments=decode_segments,
             num_decode_tokens=num_decode_tokens,
             mm_prefill_deltas=mm_prefill_deltas,
