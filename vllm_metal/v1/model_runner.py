@@ -607,6 +607,7 @@ class MetalModelRunner:
         self._selective_logits_supported = (
             self.pp is None
             and not self._is_vlm
+            and not self._lora.enabled
             and self._model_adapter.supports_selective_logits(self._forward_model)
         )
         if self._is_pooling:

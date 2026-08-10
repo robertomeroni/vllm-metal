@@ -2361,6 +2361,34 @@ class TestLoadModelPipelineSplitOrdering:
         assert events == ["load", "split", "lora"]
 
 
+class TestSelectiveLogitsLoRAGate:
+    def _load(self, *, lora_enabled: bool) -> mr.MetalModelRunner:
+        runner = make_stub_runner(
+            model_config=SimpleNamespace(runner_type="generate", hf_config=None),
+            metal_config=SimpleNamespace(use_paged_attention=True),
+            scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
+            kv_cache_dtype=None,
+        )
+        runner._model_lifecycle = SimpleNamespace(load=lambda: None)
+        runner._lora = SimpleNamespace(
+            enabled=lora_enabled, setup=lambda **kwargs: None
+        )
+        runner._model_adapter = SimpleNamespace(
+            supports_intermediate_forward=lambda model: False,
+            supports_selective_logits=lambda model: True,
+        )
+        runner.load_model()
+        return runner
+
+    def test_selection_disabled_when_lora_is_active(self) -> None:
+        # Punica routes one index per packed token, while selection hands the
+        # head one row per sequence, so the two cannot share a step.
+        assert self._load(lora_enabled=True)._selective_logits_supported is False
+
+    def test_selection_still_enabled_without_lora(self) -> None:
+        assert self._load(lora_enabled=False)._selective_logits_supported is True
+
+
 class _StageDummyRecorder:
     """Stands in for PipelinedModel: records the ids the dummy forward gets."""
 
@@ -3237,7 +3265,9 @@ class TestIntermediateBodyOnlyForward:
         )
         runner._intermediate_forward_supported = False
         runner._model_lifecycle = SimpleNamespace(load=lambda: events.append("load"))
-        runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
+        runner._lora = SimpleNamespace(
+            enabled=False, setup=lambda **kwargs: events.append("lora")
+        )
 
         # Act
         runner.load_model()
