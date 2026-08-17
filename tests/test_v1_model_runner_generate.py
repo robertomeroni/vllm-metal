@@ -2108,8 +2108,8 @@ class TestRunnerMlaProperties:
         assert runner.is_mla is False
 
 
-class TestPagedLogitsIndices:
-    """Row selection for the paged target forward.
+class TestPagedLogitsLayout:
+    """Row selection for the paged target forward, and the boundaries it makes.
 
     The packed row order is ``[decode/spec rows][prefill 0 rows]...``. Every
     decode row is consumed, but prefill sampling only reads each segment's last
@@ -2118,54 +2118,54 @@ class TestPagedLogitsIndices:
     def _make_runner(self, **attrs) -> mr.MetalModelRunner:
         return make_stub_runner(_selective_logits_supported=True, **attrs)
 
-    def test_returns_none_when_selection_unsupported(self) -> None:
+    def test_projects_every_row_when_selection_unsupported(self) -> None:
         runner = make_stub_runner(_selective_logits_supported=False)
-        assert (
-            runner._paged_logits_indices(
-                [0, 4], num_decode_tokens=0, num_decode_segments=0
-            )
-            is None
-        )
+        layout = runner._paged_logits_layout([0, 4], num_decode_segments=0)
+        assert layout.indices is None
+        assert layout.cu_seqlens == [0, 4]
 
-    def test_returns_none_for_pure_decode(self) -> None:
+    def test_projects_every_row_for_pure_decode(self) -> None:
         # Every row is sampled, so selecting would gather all of them and buy
         # nothing; the model's own __call__ is kept instead.
         runner = self._make_runner()
-        assert (
-            runner._paged_logits_indices(
-                [0, 1, 2], num_decode_tokens=2, num_decode_segments=2
-            )
-            is None
-        )
+        layout = runner._paged_logits_layout([0, 1, 2], num_decode_segments=2)
+        assert layout.indices is None
+        assert layout.cu_seqlens == [0, 1, 2]
+
+    def test_projects_every_row_when_prefills_are_single_token(self) -> None:
+        # Two 1-token prefill chunks: the selection would be the identity, so
+        # gathering would cost a copy and the split head for no rows saved.
+        runner = self._make_runner()
+        layout = runner._paged_logits_layout([0, 1, 2], num_decode_segments=0)
+        assert layout.indices is None
+        assert layout.cu_seqlens == [0, 1, 2]
 
     def test_selects_last_row_of_each_prefill(self) -> None:
         runner = self._make_runner()
-        indices = runner._paged_logits_indices(
-            [0, 4, 6, 9], num_decode_tokens=0, num_decode_segments=0
-        )
-        assert indices is not None
-        assert indices.tolist() == [3, 5, 8]
-        assert indices.dtype == mx.int32
+        layout = runner._paged_logits_layout([0, 4, 6, 9], num_decode_segments=0)
+        assert layout.indices is not None
+        assert layout.indices.tolist() == [3, 5, 8]
+        assert layout.indices.dtype == mx.int32
+        assert layout.cu_seqlens == [0, 1, 2, 3]
 
     def test_keeps_decode_prefix_then_appends_prefill_rows(self) -> None:
         # 2 decode rows, then prefills of 3 and 2 rows. Decode rows stay in place
         # so start_row stays valid; the prefill ends are 1+3-1=4 and 4+2-1=6.
         runner = self._make_runner()
-        indices = runner._paged_logits_indices(
-            [0, 1, 2, 5, 7], num_decode_tokens=2, num_decode_segments=2
-        )
-        assert indices is not None
-        assert indices.tolist() == [0, 1, 4, 6]
+        layout = runner._paged_logits_layout([0, 1, 2, 5, 7], num_decode_segments=2)
+        assert layout.indices is not None
+        assert layout.indices.tolist() == [0, 1, 4, 6]
+        assert layout.cu_seqlens == [0, 1, 2, 3, 4]
 
     def test_keeps_full_spec_verify_span_in_mixed_batch(self) -> None:
         # All three verify rows survive (argmax over the whole span decides
         # acceptance); only the prefill's final row 6 is added.
         runner = self._make_runner()
-        indices = runner._paged_logits_indices(
-            [0, 3, 7], num_decode_tokens=3, num_decode_segments=1
-        )
-        assert indices is not None
-        assert indices.tolist() == [0, 1, 2, 6]
+        layout = runner._paged_logits_layout([0, 3, 7], num_decode_segments=1)
+        assert layout.indices is not None
+        assert layout.indices.tolist() == [0, 1, 2, 6]
+        # The spec span keeps its width; the prefill collapses to one row.
+        assert layout.cu_seqlens == [0, 3, 4]
 
 
 class TestStartPagedForwardSelectiveLogits:
