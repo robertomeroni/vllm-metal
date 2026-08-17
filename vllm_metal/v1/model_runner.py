@@ -724,22 +724,21 @@ class MetalModelRunner:
         prefill sampling only ever reads each segment's last row, so the head
         need not project the rest.
 
-        ``None`` means every row is already needed — any pure-decode step — so
-        those keep the model's own ``__call__`` and pay no gather.
+        ``None`` means every row is already needed — a pure-decode step, or one
+        whose prefill segments are all single-token — so those keep the model's
+        own ``__call__`` and pay no gather.
         """
         if not self._selective_logits_supported:
             return None
-        num_rows = cu_seqlens[-1]
-        selected = [
-            *range(num_decode_tokens),
-            *(
-                cu_seqlens[num_decode_segments + i + 1] - 1
-                for i in range(len(cu_seqlens) - num_decode_segments - 1)
-            ),
-        ]
-        if len(selected) == num_rows:
+        # Boundaries past the decode prefix are the prefill segment ends; the
+        # row before each is the one prefill sampling reads.
+        prefill_ends = cu_seqlens[num_decode_segments + 1 :]
+        if num_decode_tokens + len(prefill_ends) == cu_seqlens[-1]:
             return None
-        return mx.array(selected, dtype=mx.int32)
+        return mx.array(
+            [*range(num_decode_tokens), *(end - 1 for end in prefill_ends)],
+            dtype=mx.int32,
+        )
 
     def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:
         return self._model_adapter.target_input_embeddings(
