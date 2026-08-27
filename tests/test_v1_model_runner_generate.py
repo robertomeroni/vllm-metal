@@ -2420,7 +2420,9 @@ class TestSelectiveLogitsLoRAGate:
             scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
             kv_cache_dtype=None,
         )
-        runner._model_lifecycle = SimpleNamespace(load=lambda: None)
+        runner._model_lifecycle = SimpleNamespace(
+            load=lambda: None, install_decode_dispatch=lambda: None
+        )
         runner._lora = SimpleNamespace(
             enabled=lora_enabled, setup=lambda **kwargs: None
         )
@@ -3321,18 +3323,13 @@ class TestIntermediateBodyOnlyForward:
             kv_cache_dtype=None,
         )
         runner._intermediate_forward_supported = False
-<<<<<<< HEAD
-        runner._model_lifecycle = SimpleNamespace(load=lambda: events.append("load"))
-        runner._lora = SimpleNamespace(
-            enabled=False, setup=lambda **kwargs: events.append("lora")
-        )
-=======
         runner._model_lifecycle = SimpleNamespace(
             load=lambda: events.append("load"),
             install_decode_dispatch=lambda: events.append("install"),
         )
-        runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
->>>>>>> origin/main
+        runner._lora = SimpleNamespace(
+            enabled=False, setup=lambda **kwargs: events.append("lora")
+        )
 
         # Act
         runner.load_model()
