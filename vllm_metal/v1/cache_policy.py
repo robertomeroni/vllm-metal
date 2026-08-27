@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal
 import mlx.core as mx
 import torch
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -73,28 +74,33 @@ HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
 class TurboQuantAttentionSpec(FullAttentionSpec):
     """FullAttentionSpec for TurboQuant-compressed KV cache.
 
-    Reports the true packed byte count per page via an override of
-    ``real_page_size_bytes`` so vLLM's scheduler can budget more blocks
-    than the FP16 formula would allow — without lying about ``head_size``
-    (the ``head_size_v`` reverse-engineering trick the previous version
-    used produced negative values for aggressive 2-bit configs).
-
-    Mirrors the upstream pattern of :class:`MLAAttentionSpec` which
-    overrides ``real_page_size_bytes`` for its ``fp8_ds_mla`` cache layout.
+    Publishes the packed per-(head, token) byte count through the base
+    spec's ``state_content_bytes`` field so vLLM's scheduler budgets
+    blocks from the true compressed page size — without lying about
+    ``head_size``. vLLM 0.28.0 computes ``page_size_bytes`` as
+    ``num_heads * storage_block_size * state_content_size_bytes`` and
+    demoted ``real_page_size_bytes`` to an alias, so overriding the
+    latter no longer reaches the scheduler; publishing the field is the
+    same mechanism upstream's ``TurboQuantAttentionBackend.customize_spec``
+    uses for its packed layout.
     """
 
     k_quant: str
     v_quant: str
 
-    @property
-    def real_page_size_bytes(self) -> int:
-        return turboquant_page_size_bytes(
-            block_size=self.block_size,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_size,
-            k_quant=self.k_quant,
-            v_quant=self.v_quant,
-        )
+    def __post_init__(self) -> None:
+        # Derive the packed per-cell size here, not in the builder, so a
+        # bare construction can never fall back to the dense int8 formula
+        # (the same in-class derivation pattern as the base head_size_v).
+        super().__post_init__()
+        if self.state_content_bytes is None:
+            object.__setattr__(
+                self,
+                "state_content_bytes",
+                turboquant_state_content_bytes(
+                    self.head_size, self.k_quant, self.v_quant
+                ),
+            )
 
     @classmethod
     def merge(cls, specs: Sequence[FullAttentionSpec]) -> TurboQuantAttentionSpec:
@@ -140,18 +146,29 @@ class TurboQuantAttentionSpec(FullAttentionSpec):
         )
 
 
-def turboquant_page_size_bytes(
-    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
-) -> int:
-    """Calculate TurboQuant-compressed page size for one layer."""
+def turboquant_state_content_bytes(head_dim: int, k_quant: str, v_quant: str) -> int:
+    """Packed bytes for one (head, token) cell: K + V payload plus scales.
+
+    The scale term is 3 fp16 tensors (k_scale, v_scale, v_bias) per
+    ``TQ_BLOCK_SIZE``-wide group, hence ``3 * scale_groups * 2`` bytes.
+    """
     k_bits = QUANT_PARAMS[k_quant]["bits"]
     v_bits = V_QUANT_PARAMS[v_quant]["bits"]
     k_packed = packed_dim(head_dim, k_bits)
     v_packed = packed_dim(head_dim, v_bits)
-    kv_bytes = block_size * num_kv_heads * (k_packed + v_packed)
     scale_groups = head_dim // TQ_BLOCK_SIZE
-    scale_bytes = 3 * block_size * num_kv_heads * scale_groups * 2
-    return kv_bytes + scale_bytes
+    return k_packed + v_packed + 3 * scale_groups * 2
+
+
+def turboquant_page_size_bytes(
+    block_size: int, num_kv_heads: int, head_dim: int, k_quant: str, v_quant: str
+) -> int:
+    """Calculate TurboQuant-compressed page size for one layer."""
+    return (
+        block_size
+        * num_kv_heads
+        * turboquant_state_content_bytes(head_dim, k_quant, v_quant)
+    )
 
 
 def _build_turboquant_attention_spec(
@@ -163,9 +180,9 @@ def _build_turboquant_attention_spec(
 ) -> TurboQuantAttentionSpec:
     """Build a TurboQuantAttentionSpec for a single attention layer.
 
-    Reports the real compressed page size via ``real_page_size_bytes``
-    override, so the scheduler allocates the right number of blocks and
-    ``head_size`` stays equal to the model's real head_dim.
+    The spec derives its packed ``state_content_bytes`` itself, so the
+    scheduler allocates the right number of blocks and ``head_size``
+    stays equal to the model's real head_dim.
     """
     return TurboQuantAttentionSpec(
         block_size=block_size,
@@ -283,9 +300,16 @@ class ModelCachePolicy:
     ) -> Literal[
         "paged_attention_capacity",
         "paged_attention_mha_layout_budget",
+        "pooling_no_kv",
         "single_sequence_estimate",
     ]:
         """Return which scheduler memory-reporting mode worker should use."""
+        pooling_backend = self._runner._pooling_backend
+        if (
+            pooling_backend is not None
+            and not pooling_backend.capabilities.uses_kv_cache
+        ):
+            return "pooling_no_kv"
         if paged_attention_enabled:
             if self._uses_deferred_mha_layout():
                 return "paged_attention_mha_layout_budget"
@@ -316,6 +340,13 @@ class ModelCachePolicy:
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Build the scheduler-visible KV cache specification."""
+        pooling_backend = self._runner._pooling_backend
+        if (
+            pooling_backend is not None
+            and not pooling_backend.capabilities.uses_kv_cache
+        ):
+            return {}
+
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
         torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
@@ -368,10 +399,11 @@ class ModelCachePolicy:
                 layer_name = f"layers.{layer_idx}.self_attn"
                 # MLA caches a single latent tensor per layer, not separate K
                 # and V (see ``MLAPagedLatentCache``), which is why
-                # ``_kv_factor`` bills it at 1.  ``FullAttentionSpec`` hardcodes
-                # the 2x K/V factor in ``real_page_size_bytes``, so describing
-                # MLA with it makes the engine halve the block count it plans
-                # against relative to the pool actually allocated.
+                # ``_kv_factor`` bills it at 1.  ``FullAttentionSpec`` bakes
+                # the 2x K/V factor into ``page_size_bytes`` (head_size +
+                # head_size_v), so describing MLA with it makes the engine
+                # halve the block count it plans against relative to the pool
+                # actually allocated.
                 if self._runner.is_mla:
                     specs[layer_name] = MLAAttentionSpec(
                         block_size=block_size,
@@ -395,7 +427,33 @@ class ModelCachePolicy:
                         dtype=torch_dtype,
                     )
 
+        specs.update(
+            self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
+        )
         return specs
+
+    def _draft_layer_specs(
+        self, *, block_size: int, torch_dtype: torch.dtype
+    ) -> dict[str, KVCacheSpec]:
+        """Scheduler-visible spec for the draft model's committed-KV group.
+
+        Draft models must be plain transformers (no sliding window / MLA /
+        hybrid) -- enforced at startup by ``resolve_draft_dims`` -- so a
+        uniform ``FullAttentionSpec`` per layer under distinct synthetic names
+        is enough to let the scheduler size the draft's KV cache.
+        """
+        draft_dims = self._runner._draft_dims
+        if draft_dims is None:
+            return {}
+        return {
+            f"draft_layers.{layer_idx}.self_attn": FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=draft_dims.num_kv_heads,
+                head_size=draft_dims.head_dim,
+                dtype=torch_dtype,
+            )
+            for layer_idx in range(draft_dims.num_layers)
+        }
 
     def _build_mha_attention_spec(
         self,
@@ -433,7 +491,21 @@ class ModelCachePolicy:
         upstream config is also the source of truth for scheduler KV groups, so
         adopt its grouping before serving.
         """
+        self._adopt_draft_scheduler_group(kv_cache_config)
         runtime = self._runner.paged_attention_runtime
+        pooling_backend = self._runner._pooling_backend
+        if (
+            pooling_backend is not None
+            and not pooling_backend.capabilities.uses_kv_cache
+        ):
+            if kv_cache_config.kv_cache_groups or kv_cache_config.kv_cache_tensors:
+                raise ValueError(
+                    "Metal encoder pooling does not use KV cache, but vLLM "
+                    "returned a non-empty KV cache config."
+                )
+            logger.info("Encoder pooling: no KV cache initialized.")
+            return
+
         if self._uses_deferred_mha_layout():
             if runtime is not None:
                 raise RuntimeError(
@@ -632,6 +704,45 @@ class ModelCachePolicy:
         )
         self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
 
+    def _adopt_draft_scheduler_group(self, kv_cache_config: KVCacheConfig) -> None:
+        """Tell the drafter which scheduler KV group owns its committed KV.
+
+        The draft model's own physical backend is already built by this
+        point (``install_drafter``, called from ``determine_available_memory``
+        -- before the engine has computed ``kv_cache_config``, so it cannot
+        know its group index at construction time). This runs after, once
+        ``kv_cache_config.kv_cache_groups`` exists, and resolves which group
+        the synthetic ``draft_layers.*`` names from
+        ``ModelCachePolicy._draft_layer_specs`` landed in -- mirroring
+        ``_adopt_mha_layout``'s resolution for the target. No-op without a
+        draft model configured.
+        """
+        draft_dims = self._runner._draft_dims
+        if draft_dims is None:
+            return
+        layer_names = tuple(
+            f"draft_layers.{layer_idx}.self_attn"
+            for layer_idx in range(draft_dims.num_layers)
+        )
+        group_indices = self._scheduler_group_indices_for_layers(
+            kv_cache_config, layer_names
+        )
+        if len(group_indices) != 1:
+            raise NotImplementedError(
+                "draft-model speculative decoding requires all draft layers "
+                "to share one scheduler KV cache group"
+            )
+
+        from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+
+        drafter = self._runner._drafter
+        if not isinstance(drafter, DraftModelProposer):
+            raise RuntimeError(
+                "draft KV-cache spec registered but no DraftModelProposer is "
+                f"installed (got {type(drafter).__name__})"
+            )
+        drafter.adopt_committed_group(group_indices[0])
+
     def _scheduler_group_indices_for_layers(
         self,
         kv_cache_config: KVCacheConfig,
@@ -660,7 +771,13 @@ class ModelCachePolicy:
         """Return the byte size of one cache block.
 
         For per-layer shapes, sums each layer's contribution individually.
-        For uniform shapes, reduces to the existing product formula.
+        For uniform shapes, reduces to the existing product formula. Adds the
+        draft model's own per-block bytes when one is configured (see
+        ``_draft_cache_block_size_bytes``), so every caller of this method --
+        scheduler capacity reporting and the local budget-to-num_blocks
+        division alike -- sizes against the true combined cost of one block
+        index, which now has real storage in both the target's and the
+        draft's KV-cache groups.
         """
         self._require_supported_per_layer_shapes()
         block_size = self._runner.cache_config.block_size
@@ -670,15 +787,71 @@ class ModelCachePolicy:
         # TurboQuant uses quantized KV cache with different byte layout
         config = get_config()
         if self._use_turboquant(config):
-            return num_kv_layers * turboquant_page_size_bytes(
-                block_size=block_size,
-                num_kv_heads=self._runner.num_kv_heads,
-                head_dim=self._runner.head_dim,
-                k_quant=config.k_quant,
-                v_quant=config.v_quant,
+            return (
+                num_kv_layers
+                * turboquant_page_size_bytes(
+                    block_size=block_size,
+                    num_kv_heads=self._runner.num_kv_heads,
+                    head_dim=self._runner.head_dim,
+                    k_quant=config.k_quant,
+                    v_quant=config.v_quant,
+                )
+                + self._draft_cache_block_size_bytes()
             )
 
-        return self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
+        return (
+            self._kv_factor() * block_size * dtype_size * self._kv_layer_size_sum()
+            + self._draft_cache_block_size_bytes()
+        )
+
+    def draft_scratch_reserve_blocks(self) -> int:
+        """Blocks reserved for the draft model's speculative lookahead tail.
+
+        The committed portion of the draft's KV is a normal scheduler-owned
+        group (see ``_draft_layer_specs``), so the scheduler owns every block
+        id in ``[0, num_blocks)`` for it. The *speculative* tail -- positions
+        drafted ahead of a request's committed length, not yet verified --
+        has no scheduler concept (no group is ever "ahead" of committed
+        tokens), so it stays a small proposer-local reservation sized to the
+        worst case: every concurrently active request drafting
+        ``num_speculative_tokens`` positions at once. Zero without a draft
+        model. See ``DraftModelProposer``'s split of committed vs. scratch
+        block ids, and ``WorkerCachePlanner.setup_paged_attention`` for how
+        this over-provisions the draft's *physical* backend beyond the
+        scheduler-visible block count.
+        """
+        spec = self._runner.vllm_config.speculative_config
+        if self._runner._draft_dims is None or spec is None:
+            return 0
+        block_size = self._runner.cache_config.block_size
+        extra_per_req = cdiv(spec.num_speculative_tokens, block_size)
+        return self._runner.scheduler_config.max_num_seqs * extra_per_req
+
+    def draft_scratch_reserve_bytes(self) -> int:
+        """Bytes held out of the KV budget for the draft's scratch tail.
+
+        Subtracted before dividing by the (target + draft) combined
+        per-block cost, so ``num_blocks`` leaves this much headroom in the
+        draft's own physical pool without it being scheduler-visible or
+        counted against the target's budget.
+        """
+        return (
+            self.draft_scratch_reserve_blocks() * self._draft_cache_block_size_bytes()
+        )
+
+    def _draft_cache_block_size_bytes(self) -> int:
+        """Byte size of one draft-model cache block, or 0 without a draft.
+
+        Derived from the same ``FullAttentionSpec`` objects
+        ``_draft_layer_specs`` registers with the scheduler
+        (``page_size_bytes``), rather than a parallel hand-rolled
+        formula, so the two cannot drift apart. Naturally 0 when no draft is
+        configured, since ``_draft_layer_specs`` returns ``{}`` in that case.
+        """
+        block_size = self._runner.cache_config.block_size
+        torch_dtype = MLX_TO_TORCH_DTYPE[self._require_kv_cache_dtype()]
+        specs = self._draft_layer_specs(block_size=block_size, torch_dtype=torch_dtype)
+        return sum(spec.page_size_bytes for spec in specs.values())
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Return bytes for one request's linear-attention state."""
@@ -1025,6 +1198,11 @@ class WorkerCachePlanner:
             )
             return plan.kv_budget
 
+        if mode == "pooling_no_kv":
+            self._worker.model_runner.profile_run()
+            logger.info("Encoder pooling: reporting zero KV-cache bytes")
+            return 0
+
         available = self._worker._one_sequence_kv_bytes()
         logger.info(
             "MLX path: reporting %.2f GB for scheduler admission control "
@@ -1068,7 +1246,8 @@ class WorkerCachePlanner:
             overhead,
         )
         reservation = self._hybrid_gdn_reservation()
-        kv_budget = base_kv_budget - reservation.total_bytes
+        draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
+        kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
@@ -1152,32 +1331,25 @@ class WorkerCachePlanner:
     def _memory_fraction(self) -> float:
         """Resolve the paged KV memory fraction.
 
-        Precedence:
-        1. Numeric VLLM_METAL_MEMORY_FRACTION, for example 0.6, wins.
-        2. Otherwise, VLLM_METAL_MEMORY_FRACTION=auto uses the user-provided
-           --gpu-memory-utilization value.
-        3. If the user did not provide --gpu-memory-utilization, vLLM 0.27.1
-           supplies its default value, 0.92.
+        Precedence lives in ``MetalConfig.effective_memory_fraction``; this
+        wrapper only adds the operator-facing log line.
         """
         metal_config = self._worker.metal_config
-
-        if not metal_config.is_auto_memory:
-            metal_memory_fraction = metal_config.memory_fraction
-            logger.info(
-                "Paged attention: using VLLM_METAL_MEMORY_FRACTION=%.2f",
-                metal_memory_fraction,
-            )
-            return metal_memory_fraction
-
-        vllm_memory_fraction = (
+        fraction = metal_config.effective_memory_fraction(
             self._worker.vllm_config.cache_config.gpu_memory_utilization
         )
-        logger.info(
-            "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
-            "using --gpu-memory-utilization=%.2f",
-            vllm_memory_fraction,
-        )
-        return vllm_memory_fraction
+        if metal_config.is_auto_memory:
+            logger.info(
+                "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
+                "using --gpu-memory-utilization=%.2f",
+                fraction,
+            )
+        else:
+            logger.info(
+                "Paged attention: using VLLM_METAL_MEMORY_FRACTION=%.2f",
+                fraction,
+            )
+        return fraction
 
     def _metal_limit_bytes(self) -> int:
         device_info = mx.device_info()

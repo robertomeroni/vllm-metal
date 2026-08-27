@@ -133,6 +133,52 @@ void init_library_path(const std::string& name, const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
+// NAX (M5 tensor-unit) prefill kernel support
+// ---------------------------------------------------------------------------
+
+static std::string nax_source_;
+static bool nax_lib_ready_ = false;   // a NAX library was registered
+static bool nax_enabled_ = true;      // test / A-B switch
+
+// Match MLX's hardware gate, but ignore MLX_METAL_NO_NAX because this library
+// is compiled separately. The 'p' family requires generation 18 rather than 17.
+static bool nax_hardware_supported() {
+  static const bool v = []() {
+    bool ok = false;
+    if (__builtin_available(macOS 26.2, *)) {
+      ok = true;
+    }
+    auto& d = metal::device(Device::gpu);
+    const auto& arch = d.get_architecture();
+    if (arch.empty()) return false;
+    ok &= d.get_architecture_gen() >= (arch.back() == 'p' ? 18 : 17);
+    return ok;
+  }();
+  return v;
+}
+
+void init_nax_library(const std::string& nax_src) {
+  nax_source_ = nax_src;
+  auto& d = metal::device(Device::gpu);
+  d.get_library("paged_attention_nax_kern", [&]() { return nax_source_; });
+  nax_lib_ready_ = true;
+}
+
+void init_nax_library_path(const std::string& path) {
+  init_library_path("paged_attention_nax_kern", path);
+  nax_lib_ready_ = true;
+}
+
+// Match the instantiated NAX shapes; other shapes retain the tiled path.
+static bool nax_eligible(Dtype dtype, int head_size, int block_size) {
+  return nax_lib_ready_ && nax_enabled_ &&
+      (dtype == float16 || dtype == bfloat16) &&
+      (head_size == 64 || head_size == 96 || head_size == 128 ||
+       head_size == 256 || head_size == 512) &&
+      (block_size == 8 || block_size == 16 || block_size == 32);
+}
+
+// ---------------------------------------------------------------------------
 // Helper: dtype → Metal type string
 // ---------------------------------------------------------------------------
 
@@ -278,6 +324,54 @@ static std::optional<TileConfig> select_tile_config(int head_size) {
   }
 }
 
+// Same buffer ABI as the tiled kernel, with BQ=64 and no threadgroup memory.
+static void dispatch_paged_attention_nax(
+    array& out, const array& query,
+    const array& key_cache, const array& value_cache,
+    int num_kv_heads, float scale, float softcap,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    int block_size, int sliding_window,
+    Stream s, const array* sinks) {
+  auto& d = metal::device(s.device);
+
+  constexpr int kNaxBQ = 64;
+  constexpr int kNaxThreads = 128;
+
+  int total_q_tokens = static_cast<int>(query.shape(0));
+  int head_size  = static_cast<int>(query.shape(2));
+  int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+  int total_q_blocks = total_q_tokens / kNaxBQ + num_seqs;
+  bool use_sinks = sinks != nullptr;
+
+  std::string base_kname =
+      "paged_attention_nax_" + dtype_to_metal(query.dtype()) +
+      "_hs" + std::to_string(head_size) +
+      "_bs" + std::to_string(block_size);
+  std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0");
+
+  auto* lib = d.get_library("paged_attention_nax_kern");
+  auto* kernel = d.get_kernel(
+      base_kname, lib, hash_name,
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+
+  int num_heads = static_cast<int>(query.shape(1));
+  auto& enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+
+  bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
+                          num_kv_heads, softcap, block_tables, seq_lens,
+                          cu_seqlens_q, sliding_window);
+  enc.set_bytes(scale, 9);
+  if (use_sinks) {
+    enc.set_input_array(*sinks, 18);
+  }
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_blocks, 1),
+      MTL::Size::Make(kNaxThreads, 1, 1));
+}
+
 static void dispatch_paged_attention_tiled(
     array& out, const array& query,
     const array& key_cache, const array& value_cache,
@@ -385,6 +479,14 @@ static void dispatch_paged_attention_v2_online(
   // pagedattention_tiled.metal folds the sink into each row's denominator-only
   // softmax state before final normalization.
   if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
+    if (nax_eligible(query.dtype(), head_size, block_size)) {
+      dispatch_paged_attention_nax(
+          out, query, key_cache, value_cache,
+          num_kv_heads, scale, softcap,
+          block_tables, seq_lens, cu_seqlens_q,
+          block_size, sliding_window, s, sinks);
+      return;
+    }
     if (auto cfg = select_tile_config(head_size)) {
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache,
@@ -1113,6 +1215,122 @@ void init_gdn_library(const std::string& src) {
   d.get_library("gdn_kern", [&]() { return gdn_source_; });
 }
 
+// MLX Scatter/SliceUpdate copy their destination unless it is donatable; GDN
+// pools are aliased across sibling layers, so pool[ids] = rows copies the full
+// pool. mx.fast.metal_kernel allocates fresh outputs, so this Primitive aliases
+// the pool with copy_shared_buffer; callers rebind the output so downstream
+// readers depend on the write. Destination slots must be distinct.
+
+class GDNStateScatterPrimitive : public Primitive {
+ public:
+  explicit GDNStateScatterPrimitive(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("GDNStateScatterPrimitive only supports GPU");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    // inputs:  0=pool_in, 1=src_rows, 2=dst_ids
+    // outputs: 0=pool_out (aliases pool_in; the kernel writes in place)
+    const array& pool    = inputs[0];
+    const array& src     = inputs[1];
+    const array& dst_ids = inputs[2];
+    outputs[0].copy_shared_buffer(pool);
+
+    int n = static_cast<int>(dst_ids.size());
+    if (n == 0) {
+      return;
+    }
+    int row_elems = static_cast<int>(pool.size() / pool.shape(0));
+
+    // Four elements per thread when the row divides evenly, which every GDN
+    // state layout does; the scalar kernel is the general fallback.
+    bool vec4 = (row_elems % 4) == 0;
+    int lanes = vec4 ? row_elems / 4 : row_elems;
+
+    auto s = stream();
+    auto& d = metal::device(s.device);
+    auto dt = dtype_to_metal(pool.dtype());
+    std::string kname =
+        std::string("gdn_state_scatter_rows_") + (vec4 ? "vec4_" : "") + dt;
+    auto* lib = d.get_library("gdn_kern");
+    auto* kernel = d.get_kernel(kname, lib, kname, {});
+
+    auto& enc = metal::get_command_encoder(s);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_output_array(outputs[0], 0);
+    enc.set_input_array(src,         1);
+    enc.set_input_array(dst_ids,     2);
+    enc.set_bytes(lanes,             3);
+
+    // 2D thread grid: x walks the row, y selects the update row. One
+    // threadgroup per row leaves most of the GPU idle on a 1 MiB slab.
+    //
+    // dispatch_threads maps to Metal's non-uniform dispatchThreads, so exactly
+    // `lanes` threads run along x and the kernels need no bounds check. This is
+    // the only dispatch_threads call in this file; the others round up through
+    // dispatch_threadgroups, which here would write past the end of a row.
+    int tg_x = std::min<int>(
+        lanes, static_cast<int>(kernel->maxTotalThreadsPerThreadgroup()));
+    enc.dispatch_threads(
+        MTL::Size::Make(lanes, n, 1),
+        MTL::Size::Make(tg_x, 1, 1));
+  }
+
+  const char* name() const override { return "GDNStateScatter"; }
+
+  bool is_equivalent(const Primitive& other) const override {
+    return dynamic_cast<const GDNStateScatterPrimitive*>(&other) != nullptr;
+  }
+};
+
+static array gdn_state_scatter_primitive_fn(
+    const array& pool, const array& src, const array& dst_ids) {
+  if (pool.ndim() < 2) {
+    throw std::runtime_error(
+        "gdn_state_scatter: pool must be [num_slots, ...]");
+  }
+  if (pool.dtype() != float16 &&
+      pool.dtype() != bfloat16 &&
+      pool.dtype() != float32) {
+    throw std::runtime_error(
+        "gdn_state_scatter: pool dtype must be float16, bfloat16 or float32");
+  }
+  if (src.dtype() != pool.dtype()) {
+    throw std::runtime_error("gdn_state_scatter: src and pool dtypes differ");
+  }
+  if (dst_ids.dtype() != int32) {
+    throw std::runtime_error("gdn_state_scatter: dst_ids must be int32");
+  }
+  if (dst_ids.ndim() != 1) {
+    throw std::runtime_error("gdn_state_scatter: dst_ids must be 1-D");
+  }
+  if (src.ndim() != pool.ndim() ||
+      !std::equal(
+          pool.shape().begin() + 1, pool.shape().end(),
+          src.shape().begin() + 1)) {
+    throw std::runtime_error(
+        "gdn_state_scatter: src row shape does not match pool row shape");
+  }
+  if (static_cast<size_t>(src.shape(0)) != dst_ids.size()) {
+    throw std::runtime_error(
+        "gdn_state_scatter: one dst id per src row required");
+  }
+  // The Metal kernel flattens all three inputs. Make strided views contiguous
+  // inside the MLX graph. The returned handle aliases this materialized pool,
+  // so callers must rebind it even when the input pool was already contiguous.
+  auto contiguous_pool = contiguous(pool);
+  auto contiguous_src = contiguous(src);
+  auto contiguous_ids = contiguous(dst_ids);
+  auto prim = std::make_shared<GDNStateScatterPrimitive>(
+      default_stream(Device::gpu));
+  return array::make_arrays(
+      {pool.shape()}, {pool.dtype()}, prim,
+      {contiguous_pool, contiguous_src, contiguous_ids})[0];
+}
+
 // ---------------------------------------------------------------------------
 // MLA paged attention (RFC #360)
 // ---------------------------------------------------------------------------
@@ -1415,6 +1633,24 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gdn_src"),
         "JIT-compile the GDN linear attention Metal shader.");
 
+  m.def("init_nax_library", &init_nax_library,
+        nb::arg("nax_src"),
+        "JIT-compile the NAX prefill attention Metal shader.");
+
+  m.def("init_nax_library_path", &init_nax_library_path,
+        nb::arg("path"),
+        "Load the precompiled NAX prefill .metallib from disk.");
+
+  m.def("nax_supported", &nax_hardware_supported,
+        "True when the OS and GPU expose NAX tensor units.");
+
+  m.def("nax_ready", []() { return nax_lib_ready_ && nax_enabled_; },
+        "True when the NAX prefill kernel is loaded and enabled.");
+
+  m.def("set_nax_enabled", [](bool enabled) { nax_enabled_ = enabled; },
+        nb::arg("enabled"),
+        "Runtime kill-switch for the NAX prefill kernel (tests / A-B runs).");
+
   m.def("tq_encode",
         [](nb::handle key_h, nb::handle value_h,
            nb::handle key_cache_h, nb::handle value_cache_h,
@@ -1511,6 +1747,42 @@ NB_MODULE(_paged_ops, m) {
         "kv_cache.<cache>[layer_idx] to the returned value. key/value are "
         "[num_tokens, num_kv_heads, head_size]; caches are "
         "[num_blocks, block_size, num_kv_heads, head_size].");
+
+  m.def("gdn_state_scatter",
+        [](nb::handle pool_h, nb::handle src_h, nb::handle ids_h) {
+          // inst_ptr<array> on a non-array is undefined behaviour, so check
+          // before dereferencing: a wrong type must raise, not crash.
+          nb::object mx_array_cls =
+              nb::module_::import_("mlx.core").attr("array");
+          for (nb::handle h : {pool_h, src_h, ids_h}) {
+            if (!nb::isinstance(h, mx_array_cls)) {
+              throw std::runtime_error(
+                  "gdn_state_scatter: pool, src and dst_ids must be "
+                  "mlx.core.array");
+            }
+          }
+          auto result = gdn_state_scatter_primitive_fn(
+              *nb::inst_ptr<array>(pool_h),
+              *nb::inst_ptr<array>(src_h),
+              *nb::inst_ptr<array>(ids_h));
+
+          // Same placeholder dance as tq_encode / reshape_and_cache: mint an
+          // mx.core.array and overwrite_descriptor to bypass cross-module
+          // nanobind RTTI.
+          nb::object mx_core  = nb::module_::import_("mlx.core");
+          nb::object arr_cls  = mx_core.attr("array");
+          nb::object zero_arg = nb::int_(0);
+          nb::object out      = arr_cls(zero_arg);
+          nb::inst_ptr<array>(out)->overwrite_descriptor(result);
+          return out;
+        },
+        nb::arg("pool"), nb::arg("src"), nb::arg("dst_ids"),
+        "In-place row scatter into a slot-indexed GDN state pool. Writes "
+        "src[i] into pool[dst_ids[i]] without MLX's whole-pool copy preamble; "
+        "strided inputs are materialized first, and the returned array aliases "
+        "the resulting pool buffer, so the caller MUST rebind its pool "
+        "reference. dst_ids must be distinct int32 slots; src is "
+        "[n, *pool.shape[1:]] with pool's dtype.");
 
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.

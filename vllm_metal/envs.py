@@ -25,9 +25,12 @@ if TYPE_CHECKING:
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
-    VLLM_METAL_DECODE_PIPELINE: bool = False
+    VLLM_METAL_DECODE_PIPELINE: bool = True
+    VLLM_METAL_COMPILED_MLP: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
+    VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
@@ -59,13 +62,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_GDN_LAZY_KERNELS": lambda: (
         os.getenv("VLLM_METAL_GDN_LAZY_KERNELS", "1") == "1"
     ),
-    # One-step-ahead decode pipelining (opt-in). Eligible pure-decode greedy
-    # steps defer the sampling sync one step so the next step's graph build
-    # and submit overlap the in-flight GPU forward. Set to "1" to enable;
-    # the default is the fully synchronous per-step sample path.
+    # One-step-ahead decode pipelining (default on). Eligible pure-decode
+    # greedy steps defer the sampling sync one step so the next step's graph
+    # build and submit overlap the in-flight GPU forward. Set to "0" to
+    # force the fully synchronous per-step sample path.
     "VLLM_METAL_DECODE_PIPELINE": lambda: (
-        os.getenv("VLLM_METAL_DECODE_PIPELINE", "0") == "1"
+        os.getenv("VLLM_METAL_DECODE_PIPELINE", "1") == "1"
     ),
+    # Compiled stateless-MLP dispatch (opt-in): decode-shaped MLP/MoE
+    # block calls run through an mx.compile trace, fusing the per-layer
+    # elementwise glue. Bitwise-identical on the quantized serving path;
+    # set to "1" to enable, the default keeps the eager per-op dispatch.
+    "VLLM_METAL_COMPILED_MLP": lambda: os.getenv("VLLM_METAL_COMPILED_MLP", "0") == "1",
     # Experimental MLA Metal decode kernel (RFC #360). Off by default —
     # the MLA wrapper uses the MLX SDPA per-request slow path unless
     # this opt-in is set. Set to "1" to route absorbed-MLA decode
@@ -74,6 +82,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # Emergency override for automatic M5 NAX prefill attention.
+    "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)
     # unless this opt-in is set. Set to "1" to merge K+1 verify windows
@@ -84,6 +94,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and at conc 32 on M2 Max. Outputs are bitwise identical either way.
     "VLLM_METAL_SPEC_VERIFY_WINDOW": lambda: (
         os.getenv("VLLM_METAL_SPEC_VERIFY_WINDOW", "0") == "1"
+    ),
+    # Max tokens of cold draft KV ingested per forward (issue #482,
+    # direction 3). The first propose of a fresh prefix ingests the whole
+    # prompt into the draft model's KV in one tiled prefill forward;
+    # chunking bounds the stall at any single dispatch and the logits peak
+    # allocation (draft_vocab x chunk instead of x prompt length). 1024
+    # tokens is ~2 ms of draft-model work on a modern M-series chip; a
+    # multiple of the block size is recommended. Set to "0" to restore the
+    # single-forward behavior.
+    "VLLM_METAL_SPEC_INGEST_CHUNK": lambda: int(
+        os.getenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1024")
     ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended

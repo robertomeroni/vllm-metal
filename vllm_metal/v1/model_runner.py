@@ -14,7 +14,7 @@ Key contracts:
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
-from typing import Any, Literal, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 
 import mlx.core as mx
 import numpy as np
@@ -100,6 +100,8 @@ from vllm_metal.v1.pooling.contract import (
     DecoderPoolingBackend,
     DecoderPoolingBatch,
     DecoderPoolingSpan,
+    EncoderPoolingBackend,
+    ExecutablePoolingBackend,
 )
 from vllm_metal.v1.pooling.validation import validate_pooling_request
 from vllm_metal.v1.proposer import (
@@ -122,6 +124,13 @@ from vllm_metal.v1.spec_decode import (
 )
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
+if TYPE_CHECKING:
+    # Kept out of the runtime import graph: draft_model_proposer.py pulls in
+    # mlx_lm's model loader at module scope, which should only load when
+    # draft_model speculative decoding is actually configured (see the lazy
+    # runtime import in __init__ and in install_drafter).
+    from vllm_metal.v1.draft_model_proposer import DraftDims
+
 logger = init_logger(__name__)
 
 
@@ -129,6 +138,7 @@ SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
     "paged_attention_capacity",
     "paged_attention_mha_layout_budget",
+    "pooling_no_kv",
     "single_sequence_estimate",
 ]
 
@@ -141,7 +151,6 @@ def _lora_id_from_request_data(new_req: NewRequestData) -> int | None:
 
 
 def _create_request_generator(
-    device: torch.device,
     sampling_params: SamplingParams,
 ) -> torch.Generator | None:
     """Create a per-request generator for seeded sampling.
@@ -153,7 +162,7 @@ def _create_request_generator(
         return None
     if sampling_params.temperature < GREEDY_TEMPERATURE_EPS:
         return None
-    generator = torch.Generator(device=device)
+    generator = torch.Generator(device=SamplingBatch.SAMPLER_DEVICE)
     generator.manual_seed(sampling_params.seed)
     return generator
 
@@ -179,6 +188,12 @@ class RequestState:
     # Decode reconstructs M-RoPE positions as
     # ``len(token_ids) - 1 + mrope_position_delta``; ``None`` for text-only.
     mrope_position_delta: int | None = None
+    # Scheduler-reconciled prefix-cache-hit boundary (the same value used to
+    # resume the target's own paged prefill, see `_add_new_requests`).
+    # DraftModelProposer reuses this as the committed-KV group's ingest
+    # boundary instead of self-tracking it, so a cache hit shared across
+    # requests skips re-ingest for the draft's KV too (#482).
+    num_computed_tokens: int = 0
 
 
 class PrefillRequest(NamedTuple):
@@ -326,16 +341,11 @@ class MetalModelRunner:
     Uses true batched decode with BatchKVCache for efficient parallel processing.
     """
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        device: torch.device,
-    ):
+    def __init__(self, vllm_config: VllmConfig):
         """Initialize model runner.
 
         Args:
             vllm_config: vLLM configuration
-            device: PyTorch device (CPU for Metal interop)
         """
         if vllm_config.model_config.logits_processors or entry_points(
             group=LOGITSPROCS_GROUP
@@ -349,7 +359,6 @@ class MetalModelRunner:
         self.cache_config = vllm_config.cache_config
         self.scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
-        self.device = device
         self.metal_config = get_config()
         self._model_adapter: ModelAdapter = DefaultModelAdapter()
         self._cache_policy = ModelCachePolicy(self, self._model_adapter)
@@ -364,10 +373,20 @@ class MetalModelRunner:
         self._is_pooling: bool = (
             getattr(self.model_config, "runner_type", None) == "pooling"
         )
-        self._pooling_backend: DecoderPoolingBackend | None = None
+        self._pooling_backend: ExecutablePoolingBackend | None = None
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
+        # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
+        # can size a scheduler-visible KV-cache group for the draft model
+        # before `determine_available_memory()`/`get_kv_cache_spec()` run.
+        # The draft's MLX weights load later, in `install_drafter`.
+        self._draft_dims: DraftDims | None = None
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.uses_draft_model():
+            from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
+
+            self._draft_dims = resolve_draft_dims(spec, vllm_config.parallel_config)
         self.encoder_cache: EncoderCache | None = None
 
         # Request state cache for incremental decoding
@@ -542,16 +561,22 @@ class MetalModelRunner:
     def supported_worker_tasks(self) -> tuple[SupportedTask, ...]:
         """Return worker task capabilities for the loaded model."""
         if self._is_pooling:
-            backend = self._pooling_backend
-            if backend is None:
+            pooling_backend = self._pooling_backend
+            if pooling_backend is None:
                 return ()
             if (
-                backend.capabilities.requires_paged_attention
+                pooling_backend.capabilities.requires_paged_attention
                 and self._paged_attention_runtime is None
             ):
                 return ()
-            return backend.supported_tasks()
+            return pooling_backend.supported_tasks()
         return ("generate",)
+
+    def _uses_encoder_pooling_backend(self) -> bool:
+        return (
+            self._pooling_backend is not None
+            and self._pooling_backend.capabilities.execution_kind == "encoder"
+        )
 
     def _has_paged_pooling_work(
         self,
@@ -572,10 +597,15 @@ class MetalModelRunner:
     def load_model(self) -> None:
         """Load the configured model and derive runtime metadata."""
         self._model_lifecycle.load()
+        if self._uses_encoder_pooling_backend():
+            return
         # Prune non-owned layers adjacent to the (lazy) load, before LoRA setup or
         # cache profiling materialize weights. No-op on the single-stage path.
         if self.pp is not None:
             self.apply_pipeline_split(self.pp)
+        # Wraps modules in place, so it runs after the split prunes
+        # non-owned layers (load -> split -> install; ordering test pins it).
+        self._model_lifecycle.install_decode_dispatch()
         # Resolve the intermediate-forward capability once; unsupported
         # models keep the full-logits forward on every step.
         self._intermediate_forward_supported = (
@@ -807,6 +837,14 @@ class MetalModelRunner:
         """Bytes for one request's linear attention state across all GDN layers."""
         return self._cache_policy.linear_cache_bytes_per_slot()
 
+    def draft_scratch_reserve_blocks(self) -> int:
+        """Blocks reserved for the draft model's speculative lookahead tail."""
+        return self._cache_policy.draft_scratch_reserve_blocks()
+
+    def draft_scratch_reserve_bytes(self) -> int:
+        """Bytes held out of the KV budget for the draft's scratch tail."""
+        return self._cache_policy.draft_scratch_reserve_bytes()
+
     def profile_run(self) -> int:
         """Measure MLX buffer-cache footprint of one forward pass and cap the allocator.
 
@@ -816,6 +854,8 @@ class MetalModelRunner:
         growth during serving (issue #234).
         """
         warmup_len = self.scheduler_config.max_num_batched_tokens
+        if self._uses_encoder_pooling_backend():
+            warmup_len = min(warmup_len, self.model_config.max_model_len)
         mx.clear_cache()
         cache_before = mx.get_cache_memory()
         dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
@@ -827,7 +867,7 @@ class MetalModelRunner:
     def _dummy_forward_outputs(self, input_ids: mx.array) -> list[mx.array]:
         if self._is_pooling:
             assert self._pooling_backend is not None
-            return [self._pooling_backend.forward_packed(input_ids, None)]
+            return [self._pooling_backend.profile_forward(input_ids)]
 
         if self.pp is not None and self.pp.size > 1:
             # Profile the PP stage shape: non-first stages never embed and
@@ -926,24 +966,24 @@ class MetalModelRunner:
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
+            # `num_blocks` is the scheduler-visible committed-KV capacity for
+            # the draft group (see cache_policy._draft_layer_specs); the
+            # physical backend needs `scratch_reserve_blocks` on top of that
+            # for the speculative lookahead tail, which the scheduler never
+            # sees or assigns (see draft_scratch_reserve_blocks). The KV
+            # budget already reserved this many blocks' worth of bytes off
+            # the top (WorkerCachePlanner._paged_attention_plan), so this is
+            # guaranteed to fit.
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
+                parallel_config=self.vllm_config.parallel_config,
                 controller=self._spec_decode_controller,
                 extract_logits=self._model_adapter.extract_logits,
-                num_blocks=num_blocks,
+                committed_num_blocks=num_blocks,
+                scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
             )
-            max_num_seqs = self.scheduler_config.max_num_seqs
-            extra_per_req = (spec.num_speculative_tokens + block_size - 1) // block_size
-            if num_blocks < max_num_seqs * extra_per_req:
-                raise ValueError(
-                    f"Draft KV cache too small: {num_blocks} blocks cannot "
-                    f"support {max_num_seqs} concurrent requests each needing "
-                    f"{extra_per_req} extra block(s) for "
-                    f"{spec.num_speculative_tokens} speculative tokens. "
-                    "Raise VLLM_METAL_MEMORY_FRACTION or lower --max-num-seqs."
-                )
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer
 
@@ -1001,7 +1041,6 @@ class MetalModelRunner:
             prompt_token_id_lists,
             output_token_id_lists,
             vocab_size=self._vocab_size,
-            device=self.device,
             generators=generators,
         ).make_sampling_metadata()
 
@@ -1037,10 +1076,9 @@ class MetalModelRunner:
             [token_ids],
             [[]],
             vocab_size=vocab_size,
-            device=self.device,
             generators=generators,
         )
-        result = sample_from_logits(last_logits, batch, self._sampler, self.device)
+        result = sample_from_logits(last_logits, batch, self._sampler)
         [next_token] = result.token_ids
         mx.eval(*[c.state for c in cache])
 
@@ -1098,12 +1136,9 @@ class MetalModelRunner:
             prompt_token_ids_list,
             output_tokens_list,
             vocab_size=vocab_size,
-            device=self.device,
             generators=generators,
         )
-        result = sample_from_logits(
-            next_token_logits, batch, self._sampler, self.device
-        )
+        result = sample_from_logits(next_token_logits, batch, self._sampler)
         next_tokens = result.token_ids
 
         # Extract updated caches back to individual requests
@@ -1145,10 +1180,9 @@ class MetalModelRunner:
                 [state.token_ids[: state.prompt_len]],
                 [state.token_ids[state.prompt_len :]],
                 vocab_size=vocab_size,
-                device=self.device,
                 generators=generators,
             )
-            result = sample_from_logits(last_logits, batch, self._sampler, self.device)
+            result = sample_from_logits(last_logits, batch, self._sampler)
             [next_token] = result.token_ids
 
             next_tokens.append(next_token)
@@ -1343,7 +1377,11 @@ class MetalModelRunner:
             )
             if has_pooling_work:
                 assert self._pooling_backend is not None
-                pooling_hidden_states = self._pooling_backend.forward_packed(
+                decoder_pooling_backend = cast(
+                    DecoderPoolingBackend,
+                    self._pooling_backend,
+                )
+                pooling_hidden_states = decoder_pooling_backend.forward_packed(
                     input_ids,
                     offset_caches,
                 )
@@ -1557,12 +1595,16 @@ class MetalModelRunner:
 
         if pooling_hidden_states is not None:
             assert self._pooling_backend is not None
+            decoder_pooling_backend = cast(
+                DecoderPoolingBackend,
+                self._pooling_backend,
+            )
             mx.eval(pooling_hidden_states)
             pooling_batch = batch.decoder_pooling_batch(
                 cu_seqlens,
                 num_decode_segments,
             )
-            pooler_outputs = self._pooling_backend.pool_packed(
+            pooler_outputs = decoder_pooling_backend.pool_packed(
                 pooling_hidden_states,
                 pooling_batch,
             )
@@ -1672,14 +1714,10 @@ class MetalModelRunner:
                     prompt_token_ids_list,
                     output_tokens_list,
                     vocab_size=vocab_size,
-                    device=self.device,
                     generators=generators,
                 )
                 plain_result = sample_from_logits(
-                    plain_logits,
-                    plain_batch,
-                    self._sampler,
-                    self.device,
+                    plain_logits, plain_batch, self._sampler
                 )
                 for plain_index, (decode_index, _, _) in enumerate(plain_items):
                     decode_token_ids[decode_index] = [
@@ -1696,7 +1734,6 @@ class MetalModelRunner:
                 decode_reqs,
                 num_decode_tokens,
                 self._sampler,
-                self.device,
                 vocab_size=vocab_size,
             )
             decode_token_ids = [[token_id] for token_id in decode_result.token_ids]
@@ -1707,7 +1744,6 @@ class MetalModelRunner:
             logits_cu_seqlens,
             num_decode_segments,
             self._sampler,
-            self.device,
             vocab_size=vocab_size,
         )
 
@@ -1760,6 +1796,7 @@ class MetalModelRunner:
                     block_ids=prefill.block_ids,
                     lora_id=prefill.lora_id,
                     mrope_position_delta=mm_delta,
+                    num_computed_tokens=prefill.start_pos,
                 )
                 continue
 
@@ -2201,7 +2238,7 @@ class MetalModelRunner:
             validate_pooling_request(
                 new_req,
                 self.model_config,
-                backend=self._pooling_backend,
+                pooling_backend=self._pooling_backend,
                 paged_attention_enabled=self._paged_attention_runtime is not None,
             )
 
@@ -2217,7 +2254,7 @@ class MetalModelRunner:
                 batch.add_output(req_id, [0])
                 continue
 
-            generator = _create_request_generator(self.device, sampling_params)
+            generator = _create_request_generator(sampling_params)
 
             if self._paged_attention_runtime is not None:
                 sched_block_ids = self._copy_paged_block_ids(new_req.block_ids)
@@ -2265,6 +2302,7 @@ class MetalModelRunner:
                         generated_tokens=0,
                         block_ids=sched_block_ids,
                         lora_id=lora_id,
+                        num_computed_tokens=computed_tokens,
                     )
                 continue
 
@@ -2500,6 +2538,21 @@ class MetalModelRunner:
             pooler_output=batch.pooler_outputs,
         )
 
+    def _run_encoder_pooling_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> ModelRunnerOutput:
+        assert self._pooling_backend is not None
+        pooling_backend = cast(EncoderPoolingBackend, self._pooling_backend)
+        batch = _ExecutionBatch()
+        for output in pooling_backend.pool_scheduler_output(
+            scheduler_output,
+            self.model_config,
+        ):
+            batch.add_output(output.req_id, [], None, output.pooler_output)
+        self._validate_scheduled_outputs(batch, scheduler_output)
+        return self._build_output(batch)
+
     def _run_non_paged_decode_batch(self, batch: _ExecutionBatch) -> None:
         """Run non-paged decode work."""
         if batch.valid_decode_reqs:
@@ -2625,6 +2678,8 @@ class MetalModelRunner:
         """
         if self.model is None:
             raise RuntimeError("Model not loaded")
+        if self._uses_encoder_pooling_backend():
+            return self._run_encoder_pooling_batch(scheduler_output)
 
         # Gate the decode pipeline for this step BEFORE any state mutation:
         # an ineligible step must resolve the pending deferred sample first so

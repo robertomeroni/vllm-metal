@@ -9,12 +9,14 @@ path. All require synchronous scheduling and greedy sampling.
 | Target models | Gemma4 (paged) | Any paged-attention model | Any paged-attention model |
 | Draft source | MTP assistant checkpoint (reads target KV cache) | Separate smaller model (own KV cache) | Prompt/output token history (no model) |
 | `num_speculative_tokens` | 1 | Configurable (3–5 typical) | Configurable (3–5 typical) |
-| Extra memory | None (reads target KV cache) | Second un-budgeted KV cache | None |
+| Extra memory | None (reads target KV cache) | Second scheduler-managed KV cache | None |
 
 All three methods:
 
-- Require `--no-async-scheduling` (vLLM auto-disables async for most spec-decode
-  methods; pass it explicitly to be safe).
+- Run with synchronous scheduling. The Metal platform disables async
+  scheduling automatically whenever speculative decoding is configured
+  (vLLM 0.28.0 auto-enables async for draft-model spec decode); passing
+  `--no-async-scheduling` explicitly remains fine.
 - Only accelerate greedy requests (`temperature=0`). Non-greedy requests skip
   drafting silently.
 - Are lossless under greedy decoding.
@@ -126,11 +128,16 @@ Confirm speculative decoding is active: the server log shows
 
 ### Limitations
 
-- **Draft KV cache is un-budgeted.** The draft gets its own KV cache sized to
-  the target's `num_blocks`, allocated after the target KV budget and not
-  subtracted from it. Keep `VLLM_METAL_MEMORY_FRACTION` well below 1.0.
-- **SWA draft models untested.** The draft block allocator assumes full
-  attention.
+- **Draft KV cache is scheduler-managed.** The committed portion of the
+  draft's KV is a scheduler-owned KV-cache group, hashed, matched, admitted,
+  and evicted like the target's own groups and counted against the shared
+  Metal KV budget. Only the speculative lookahead tail
+  (`num_speculative_tokens` positions ahead of the committed length) is a
+  small proposer-local scratch reservation, pre-reserved before the budget is
+  divided.
+- **No sliding-window or hybrid draft models.** The draft block allocator
+  assumes full attention; ``resolve_draft_dims`` rejects draft configs with
+  ``sliding_window`` or mixed ``layer_types`` at startup.
 - **No pipeline parallelism.** `pipeline_parallel_size>1` with speculative
   config raises at startup.
 
@@ -148,6 +155,15 @@ the draft's per-round committed-token ingest also rides the window layout of
 the paged decode kernel, sharing KV block loads across its rows like the
 target's verification window; generated tokens are identical either way, and
 single-stream TPOT is within run-to-run noise of the expanded layout.
+
+The ingest also skips re-computing KV it already holds: the lookahead draft
+steps write KV for drafts `d1..d(K-1)`, and when the verifier accepts those
+drafts the next round's ingest starts after them instead of recomputing
+(shrinking the steady-state K+1-token ingest to 2 rows on full acceptance).
+A skipped position requires both its committed token to equal the drafted
+token and the scheduler's block table to still map it to the same physical
+block the speculative write landed in, so rejected drafts, re-allocated
+blocks, and scratch-block writes always fall back to a full re-ingest.
 
 ---
 

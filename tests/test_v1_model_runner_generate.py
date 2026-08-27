@@ -19,6 +19,7 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
+import vllm_metal.envs as metal_envs
 import vllm_metal.v1.model_runner as mr
 from tests.stub_runner import make_stub_runner
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
@@ -167,7 +168,7 @@ class TestV1MetalModelRunnerGenerate:
         )
 
         with pytest.raises(NotImplementedError, match="custom logits processors"):
-            mr.MetalModelRunner(vllm_config, torch.device("cpu"))
+            mr.MetalModelRunner(vllm_config)
 
     def test_warm_up_propagates_dummy_forward_failure(self) -> None:
         runner = self._make_runner()
@@ -1234,8 +1235,8 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         )
         sampled_rows = []
 
-        def fake_sample_from_logits(logits_2d, batch, sampler, device):
-            del sampler, device
+        def fake_sample_from_logits(logits_2d, batch, sampler):
+            del sampler
             sampled_rows.append(logits_2d.tolist())
             assert [sp.temperature for sp in batch.sampling_params_list] == [0.7]
             return mr._SamplingResult([4])
@@ -2396,13 +2397,19 @@ class TestLoadModelPipelineSplitOrdering:
             scheduler_config=SimpleNamespace(max_num_seqs=1, max_num_batched_tokens=1),
             kv_cache_dtype=None,
         )
-        runner._model_lifecycle = SimpleNamespace(load=lambda: events.append("load"))
+        runner._model_lifecycle = SimpleNamespace(
+            load=lambda: events.append("load"),
+            install_decode_dispatch=lambda: events.append("install"),
+        )
         runner.apply_pipeline_split = lambda pp: events.append("split")
         runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
 
         runner.load_model()
 
-        assert events == ["load", "split", "lora"]
+        # Decode-dispatch installs wrap model modules in place, so they
+        # come after the split prunes non-owned layers, and the split itself
+        # stays adjacent to the (lazy) load before LoRA setup.
+        assert events == ["load", "split", "install", "lora"]
 
 
 class TestSelectiveLogitsLoRAGate:
@@ -2549,9 +2556,15 @@ class TestPipelineGateSpecDecodeDerivation:
     """Runner-side gate derivation: spec decode disables the pipeline."""
 
     @pytest.fixture(autouse=True)
-    def _opt_in_pipeline(self, monkeypatch) -> None:
-        # The pipeline is opt-in; gate derivation is tested with it enabled.
+    def _enable_pipeline(self, monkeypatch) -> None:
+        # Set explicitly so gate derivation stays deterministic regardless
+        # of the flag's default.
         monkeypatch.setenv("VLLM_METAL_DECODE_PIPELINE", "1")
+
+    def test_pipeline_flag_defaults_on(self, monkeypatch) -> None:
+        # The kill switch defaults to enabled; "0" is the opt-out.
+        monkeypatch.delenv("VLLM_METAL_DECODE_PIPELINE", raising=False)
+        assert metal_envs.VLLM_METAL_DECODE_PIPELINE is True
 
     def _runner(self, drafter: object | None = None) -> mr.MetalModelRunner:
         runner = make_stub_runner()
@@ -3308,10 +3321,18 @@ class TestIntermediateBodyOnlyForward:
             kv_cache_dtype=None,
         )
         runner._intermediate_forward_supported = False
+<<<<<<< HEAD
         runner._model_lifecycle = SimpleNamespace(load=lambda: events.append("load"))
         runner._lora = SimpleNamespace(
             enabled=False, setup=lambda **kwargs: events.append("lora")
         )
+=======
+        runner._model_lifecycle = SimpleNamespace(
+            load=lambda: events.append("load"),
+            install_decode_dispatch=lambda: events.append("install"),
+        )
+        runner._lora = SimpleNamespace(setup=lambda **kwargs: events.append("lora"))
+>>>>>>> origin/main
 
         # Act
         runner.load_model()
